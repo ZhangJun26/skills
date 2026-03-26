@@ -12,6 +12,10 @@
 import sys, time, os
 from pathlib import Path
 
+# bootstrap：先把 skill 根目录加入 path，才能 import slide_vault
+_SKILL_DIR_BOOTSTRAP = Path(__file__).parent.parent
+sys.path.insert(0, str(_SKILL_DIR_BOOTSTRAP))
+
 from slide_vault.config import CONFIG_PATH
 SKILL_DIR = CONFIG_PATH.parent
 os.chdir(str(SKILL_DIR))

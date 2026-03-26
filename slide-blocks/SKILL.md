@@ -26,11 +26,16 @@ sys.path.insert(0, str(SKILL_DIR / "engine"))
 import yaml
 _config = yaml.safe_load((SKILL_DIR / "config.yaml").read_text(encoding="utf-8"))
 MATERIALS_DIR = _config.get("materials_dir", "")
-OUTPUT_DIR    = Path(_config.get("output_dir", str(SKILL_DIR / "输出")))
+OUTPUT_DIR    = _config.get("output_dir", "")
 TEMPLATE_DIR  = SKILL_DIR / "模板"
 ```
 
-如果 `MATERIALS_DIR` 为空，提醒用户先填写 `config.yaml` 并运行 `setup_paths.py`，再继续。
+初始化后，根据用户需求判断模式：
+
+- **Mode A（工具模式）**：统一标题栏、深浅色转换、局部编辑 — 不依赖素材库，`MATERIALS_DIR` 为空也可以直接进行
+- **Mode B（素材库模式）**：搜索素材、组装 PPT — 需要 `MATERIALS_DIR` 非空且已运行 `setup_paths.py`
+
+如果 `OUTPUT_DIR` 为空，提醒用户先在 `config.yaml` 填写 `output_dir`（建议填 skill 目录之外的路径，如 `D:/PPT输出`，避免 skill 更新时被覆盖）。
 
 ---
 
@@ -113,6 +118,10 @@ PLAN = [
 import sys, os
 from pathlib import Path
 
+# 先把 skill 根目录加入 path，才能 import slide_vault
+_SKILL_DIR_BOOTSTRAP = Path(__file__).parent.parent
+sys.path.insert(0, str(_SKILL_DIR_BOOTSTRAP))
+
 from slide_vault.config import CONFIG_PATH
 SKILL_DIR = CONFIG_PATH.parent
 os.chdir(str(SKILL_DIR))
@@ -121,7 +130,7 @@ sys.path.insert(0, str(SKILL_DIR / "engine"))
 import assemble_template, yaml
 
 _config = yaml.safe_load((SKILL_DIR / "config.yaml").read_text(encoding="utf-8"))
-OUTPUT_DIR = Path(_config.get("output_dir", str(SKILL_DIR / "输出")))
+OUTPUT_DIR = Path(_config["output_dir"])  # 必须在 config.yaml 里填写，不设默认值
 
 # 浅色底模板取消下面注释：
 # assemble_template.TEMPLATE_PATH = SKILL_DIR / "模板/蓝色商务（浅色底）.pptx"
@@ -170,6 +179,34 @@ edit("输出/xxx.pptx", [
 
 ---
 
+## 整份 PPT 色系转换
+
+将一整份 PPT 从深色底转为浅色底（或反向），无需重新组装：
+
+```python
+import sys, os
+from pathlib import Path
+
+_SKILL_DIR_BOOTSTRAP = Path(__file__).parent.parent
+sys.path.insert(0, str(_SKILL_DIR_BOOTSTRAP))
+
+from slide_vault.config import CONFIG_PATH
+SKILL_DIR = CONFIG_PATH.parent
+os.chdir(str(SKILL_DIR))
+sys.path.insert(0, str(SKILL_DIR / "engine"))
+
+from convert_deck import convert
+
+convert("D:/输入文件.pptx", to="light")   # 深色底 → 浅色底，自动选模板
+convert("D:/输入文件.pptx", to="dark")    # 浅色底 → 深色底，自动选模板
+```
+
+输出文件自动保存至同目录，文件名加 `_浅色底` / `_深色底` 后缀。颜色修复自动触发。
+
+**封面自动判断**：第一页如果是极简封面（无图表/表格，文字 ≤ 3 个且总字数 ≤ 60），自动替换为模板封面；否则视为内容页，只做色系转换，不替换内容。
+
+---
+
 ## 模板页说明
 
 | 页码 | 用途 |
@@ -188,7 +225,10 @@ P3/P4 由引擎自动检测，不需要在 PLAN 里手动指定。
 
 - 电脑必须安装 Microsoft Office 或 WPS
 - 运行期间不要手动操作 PowerPoint 窗口
-- 深色底素材 + 浅色底模板：plan 项加 `"fix_colors": true` 可自动修复白色文字
+- **颜色修复**：按需触发，不主动改动
+  - 文件名含"深色底"/"浅色底"关键词 → 与模板方向相反时自动触发
+  - 文件名没有关键词，但用户明确说"转成浅色底/深色底" → 在每个内容页 plan 项手动加 `"fix_colors": true`（浅色底方向）或 `"fix_colors_dark": true`（深色底方向）
+  - 用户没有提转换需求 → 不触发，保留原始颜色
 - 输出同名文件会被覆盖，重要版本提前重命名备份
 
 ---

@@ -86,9 +86,34 @@ def _is_end_slide(slide):
     return len(all_text) <= 30
 
 
+def _is_cover_slide(slide):
+    """
+    判断是否为封面页：无图片/图表/表格，文字形状 ≤ 3，总文字 ≤ 60 字。
+    标准与 _is_transition_slide 相同，封面和过渡页结构上都是"标题+副标题"式极简布局。
+    如果第一页内容更丰富（有详细正文），应当作普通内容页色系转换，而不是替换为模板封面。
+    """
+    for shape in slide.shapes:
+        if getattr(shape, 'shape_type', 0) == 13:   # PICTURE
+            return False
+        try:
+            if shape.has_chart:
+                return False
+        except Exception:
+            pass
+        try:
+            if shape.has_table:
+                return False
+        except Exception:
+            pass
+    text_shapes = [s for s in slide.shapes
+                   if s.has_text_frame and s.text_frame.text.strip()]
+    all_text = ' '.join(s.text_frame.text.strip() for s in text_shapes)
+    return len(text_shapes) <= 3 and len(all_text) <= 60
+
+
 # ─── PLAN 自动生成 ────────────────────────────────────────────────────────────
 
-def _auto_plan(src_path):
+def _auto_plan(src_path, to):
     """
     扫描源文件，自动生成 PLAN：
     - 第 1 页 → 模板封面（P1），提取标题
@@ -96,12 +121,23 @@ def _auto_plan(src_path):
     - 中间过渡页（少文字、无图表）→ 模板过渡页（P2），提取章节标题
     - 其余 → 内容页（src + page，由引擎自动选 P3/P4）
 
+    to 参数用于判断颜色修复方向：
+    - 文件名含方向关键词时引擎会自动触发，无需额外字段
+    - 文件名不含关键词时，根据 to 显式注入 fix_colors / fix_colors_dark，
+      确保用户明确说"转成浅色/深色"时颜色修复一定生效
+
     关于组装规则（开篇不加过渡页 / 后续章节加过渡页）：
     源文件里的过渡页已经在原来的位置，直接映射为模板 P2 即可，
     无需 assemble_template 里的"开篇不加过渡页"规则干预。
     """
     from pptx import Presentation
     src_str = str(Path(src_path).resolve())
+    src_name = Path(src_path).name
+
+    # 文件名没有方向关键词时，根据 to 显式注入颜色修复标记
+    needs_light_fix = to == "light" and "深色底" not in src_name
+    needs_dark_fix  = to == "dark"  and "浅色底" not in src_name
+
     prs = Presentation(src_str)
     n   = len(prs.slides)
     plan = []
@@ -109,10 +145,19 @@ def _auto_plan(src_path):
     for i, slide in enumerate(prs.slides):
         pn = i + 1
 
-        if i == 0:
-            # 第一页 → 封面，提取标题
+        if i == 0 and _is_cover_slide(slide):
+            # 第一页是极简封面（无图表/表格，文字 ≤ 3 个且总字数 ≤ 60）→ 替换为模板封面
             title = _extract_title(slide)
             plan.append({"template_page": 1, "replace_title": title})
+
+        elif i == 0:
+            # 第一页有实质内容 → 当普通内容页处理（保留原始布局，只做色系转换）
+            item = {"src": src_str, "page": pn}
+            if needs_light_fix:
+                item["fix_colors"] = True
+            elif needs_dark_fix:
+                item["fix_colors_dark"] = True
+            plan.append(item)
 
         elif i == n - 1 and _is_end_slide(slide):
             # 最后一页且内容极少 → 封底
@@ -125,7 +170,12 @@ def _auto_plan(src_path):
 
         else:
             # 普通内容页 → 套模板背景 + 保留源内容（引擎自动选 P3/P4）
-            plan.append({"src": src_str, "page": pn})
+            item = {"src": src_str, "page": pn}
+            if needs_light_fix:
+                item["fix_colors"] = True
+            elif needs_dark_fix:
+                item["fix_colors_dark"] = True
+            plan.append(item)
 
     return plan
 
@@ -167,7 +217,7 @@ def convert(src, output_name=None, to='light', template_path=None):
     print(f"  模板：{Path(template_path).name}")
 
     # 自动生成 PLAN
-    plan = _auto_plan(src)
+    plan = _auto_plan(src, to)
     n_content    = sum(1 for p in plan if "src" in p)
     n_transition = sum(1 for p in plan if p.get("template_page") == 2)
     print(f"  页数：共 {len(plan)} 页（内容页 {n_content}，过渡页 {n_transition}，封面1，封底1）\n")

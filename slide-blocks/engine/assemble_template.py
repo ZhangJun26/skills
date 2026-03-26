@@ -167,7 +167,10 @@ def paste_shapes_with_source_format(pptApp, pres, current_idx):
 
 # ─── 颜色修复（深色底来源 → 浅色底模板适配） ─────────────────────────────────────
 
-_DARK_HEX = '262626'  # 深灰，替换浅色文字
+_DARK_HEX = '262626'              # 深灰，替换浅色实色文字
+# 渐变文字替换色：[起始色, 结束色]，中间停止点线性插值
+# RGB(1,101,255) → RGB(0,184,243)：蓝到青蓝
+_GRADIENT_FALLBACK_COLORS = ['0165FF', '00B8F3']
 
 # 浅色预设颜色名（prstClr val="white" 等），全部替换为深色
 _LIGHT_PRESET_COLORS = {
@@ -192,6 +195,37 @@ def _hex_luminance(hex_val):
     g = int(hex_val[2:4], 16)
     b = int(hex_val[4:6], 16)
     return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _srgbclr_effective_luminance(srgbclr_el):
+    """
+    计算 <a:srgbClr> 元素的实际感知亮度（0-255），考虑 lumMod/lumOff 子元素。
+    例：val="5B9BD5" + lumOff=95000 → L 接近 100% → 近白色。
+    无法计算时返回 None（调用方回退到 _is_light_hex）。
+    """
+    import colorsys
+    NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    val = srgbclr_el.get('val', '')
+    if len(val) != 6:
+        return None
+    try:
+        r = int(val[0:2], 16) / 255
+        g = int(val[2:4], 16) / 255
+        b = int(val[4:6], 16) / 255
+        h, l, s = colorsys.rgb_to_hls(r, g, b)
+
+        lum_mod = srgbclr_el.find(f'{{{NS_A}}}lumMod')
+        lum_off = srgbclr_el.find(f'{{{NS_A}}}lumOff')
+        if lum_mod is not None:
+            l = l * (int(lum_mod.get('val', '100000')) / 100000)
+        if lum_off is not None:
+            l = l + (int(lum_off.get('val', '0')) / 100000)
+        l = max(0.0, min(1.0, l))
+
+        r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+        return 0.299 * r2 * 255 + 0.587 * g2 * 255 + 0.114 * b2 * 255
+    except Exception:
+        return None
 
 
 def _shape_has_dark_fill(shape, threshold=140):
@@ -220,12 +254,20 @@ def _shape_has_dark_fill(shape, threshold=140):
             if grad is not None:
                 stops = grad.findall(f'.//{{{NS_A}}}gs')
                 lums = []
+                alphas = []
                 for gs in stops:
                     clr = gs.find(f'{{{NS_A}}}srgbClr')
                     if clr is not None:
                         val = clr.get('val', '')
                         if len(val) == 6:
                             lums.append(_hex_luminance(val))
+                        # 检测 alpha 透明度
+                        alpha_el = clr.find(f'{{{NS_A}}}alpha')
+                        if alpha_el is not None:
+                            alphas.append(int(alpha_el.get('val', '100000')) / 100000)
+                # 渐变平均 alpha < 50% → 实际接近透明，视为非深色背景
+                if alphas and (sum(alphas) / len(alphas)) < 0.5:
+                    return False
                 if lums:
                     return (sum(lums) / len(lums)) < threshold
 
@@ -256,12 +298,26 @@ def _fix_solidfill_el(sf_el, dark_hex):
     if child.tag == PRSTCLR and child.get('val', '') in _LIGHT_PRESET_COLORS:
         sf_el.remove(child)
         etree.SubElement(sf_el, SRGBCLR).set('val', dark_hex)
-    elif child.tag == SRGBCLR and _is_light_hex(child.get('val', '')):
-        child.set('val', dark_hex)
-    elif child.tag == SCHEMECLR and child.get('val', '') in _LIGHT_SCHEME_COLORS:
-        # bg1/lt1/bg2/lt2 在浅色底模板里 = 白色，必须换成显式深色
-        sf_el.remove(child)
-        etree.SubElement(sf_el, SRGBCLR).set('val', dark_hex)
+    elif child.tag == SRGBCLR:
+        # 先计算含 lumMod/lumOff 的实际亮度，再回退到基础色判断
+        eff_lum = _srgbclr_effective_luminance(child)
+        is_light = (eff_lum is not None and eff_lum > 200) or \
+                   (eff_lum is None and _is_light_hex(child.get('val', '')))
+        if is_light:
+            child.set('val', dark_hex)
+            # 移除 lumMod/lumOff（已替换为纯色，修饰子元素无意义）
+            for mod_tag in [f'{{{NS_A}}}lumMod', f'{{{NS_A}}}lumOff', f'{{{NS_A}}}lumClamp']:
+                mod_el = child.find(mod_tag)
+                if mod_el is not None:
+                    child.remove(mod_el)
+    elif child.tag == SCHEMECLR:
+        is_light_slot = child.get('val', '') in _LIGHT_SCHEME_COLORS
+        # 任意主题色 + lumOff >= 40000（向白色推移 40%+）→ 实际接近白色
+        lum_off_el = child.find(f'{{{NS_A}}}lumOff')
+        has_high_lumoff = lum_off_el is not None and int(lum_off_el.get('val', '0')) >= 40000
+        if is_light_slot or has_high_lumoff:
+            sf_el.remove(child)
+            etree.SubElement(sf_el, SRGBCLR).set('val', dark_hex)
 
 
 def _fix_gradfill_el(gf_el, dark_hex):
@@ -277,26 +333,41 @@ def _fix_gradfill_el(gf_el, dark_hex):
     if parent is None:
         return
 
-    # 收集所有色标的亮度
+    # 收集所有色标的有效亮度
     lums = []
     for gs in gf_el.iter(f'{{{NS_A}}}gs'):
         clr = gs.find(SRGBCLR)
         if clr is not None:
             val = clr.get('val', '')
             if len(val) == 6:
-                lums.append(_hex_luminance(val))
+                # 考虑 lumMod/lumOff 的实际亮度
+                eff = _srgbclr_effective_luminance(clr)
+                lums.append(eff if eff is not None else _hex_luminance(val))
         sc = gs.find(SCHEMECLR)
-        if sc is not None and sc.get('val', '') in _LIGHT_SCHEME_COLORS:
-            lums.append(255)  # 视为浅色
+        if sc is not None:
+            is_light_slot = sc.get('val', '') in _LIGHT_SCHEME_COLORS
+            lum_off_el = sc.find(f'{{{NS_A}}}lumOff')
+            has_high_lumoff = lum_off_el is not None and int(lum_off_el.get('val', '0')) >= 40000
+            if is_light_slot or has_high_lumoff:
+                lums.append(255)  # 视为浅色
 
-    # 全部色标都是浅色（平均亮度 > 200）→ 替换为深色 solidFill
+    # 全部色标都是浅色（平均亮度 > 200）→ 替换为渐变色，保留原有渐变结构（角度/方向不变）
     if lums and (sum(lums) / len(lums)) > 200:
-        idx = list(parent).index(gf_el)
-        parent.remove(gf_el)
-        sf = etree.Element(f'{{{NS_A}}}solidFill')
-        sc_el = etree.SubElement(sf, SRGBCLR)
-        sc_el.set('val', dark_hex)
-        parent.insert(idx, sf)
+        stops = [gs for gs in gf_el.iter(f'{{{NS_A}}}gs')]
+        n = len(stops)
+        c1 = _GRADIENT_FALLBACK_COLORS[0]
+        c2 = _GRADIENT_FALLBACK_COLORS[-1]
+        for i, gs in enumerate(stops):
+            # 线性插值：0 → c1，n-1 → c2
+            t = i / max(n - 1, 1)
+            r = int(int(c1[0:2], 16) * (1 - t) + int(c2[0:2], 16) * t)
+            g = int(int(c1[2:4], 16) * (1 - t) + int(c2[2:4], 16) * t)
+            b = int(int(c1[4:6], 16) * (1 - t) + int(c2[4:6], 16) * t)
+            interp = f'{r:02X}{g:02X}{b:02X}'
+            # 清空色标内原有颜色子元素，换成新 srgbClr
+            for old_clr in list(gs):
+                gs.remove(old_clr)
+            etree.SubElement(gs, SRGBCLR).set('val', interp)
 
 
 def _fix_text_colors_xml(slide_element, dark_hex=_DARK_HEX):
@@ -325,24 +396,113 @@ def _fix_text_colors_xml(slide_element, dark_hex=_DARK_HEX):
                     pass
 
 
-def _fix_shape_text_colors_smart(shape, dark_hex=_DARK_HEX):
+# 模块级变量：当前处理 slide 的深色形状区域（left, top, right, bottom），单位 EMU
+# 由 fix_colors_for_light_template 在处理每页前更新
+_dark_regions: list = []
+
+
+def _shape_on_dark_region(shape):
     """
-    智能修复单个形状的文字颜色：
-    - 形状有深色背景填充 → 跳过（白字保留，适合深色框）
-    - 形状背景浅色/透明  → 修复白字为深色
-    递归处理组合形状。
+    判断透明/无填充形状是否叠在深色兄弟形状上（slide 级位置检测）。
+    用于解决 TEXT_BOX 透明填充但视觉上位于深色面板上的误改问题（P49 类型）。
+    """
+    if not _dark_regions:
+        return False
+    try:
+        sl = shape.left;  st = shape.top
+        sr = sl + shape.width;  sb = st + shape.height
+        for (rl, rt, rr, rb) in _dark_regions:
+            # 重叠面积超过形状面积 30% → 视为在深色区域上
+            ox = max(0, min(sr, rr) - max(sl, rl))
+            oy = max(0, min(sb, rb) - max(st, rt))
+            overlap = ox * oy
+            area = max((sr - sl) * (sb - st), 1)
+            if overlap / area > 0.65:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _fix_gradient_text_xml(element):
+    """
+    只修复元素内的渐变文字（gradFill）→ 标准蓝。
+    用于深色背景形状：保留实色白字，但渐变近白色文字必须改（lumOff 设计的近白色在浅色底无效）。
+    """
+    NS_A     = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    GRADFILL = f'{{{NS_A}}}gradFill'
+    RPR      = f'{{{NS_A}}}rPr'
+    DEFRPR   = f'{{{NS_A}}}defRPr'
+    for tag in (RPR, DEFRPR):
+        for el in element.iter(tag):
+            for gf in el.findall(GRADFILL):
+                try:
+                    _fix_gradfill_el(gf, _DARK_HEX)
+                except Exception:
+                    pass
+
+
+def _fix_shape_text_colors_smart(shape, dark_hex=_DARK_HEX, _sibling_dark=None):
+    """
+    修复单个形状的文字颜色（深色底来源 → 浅色底）：
+    - 形状有显式深色填充 → 保留白字（只修渐变文字）
+    - 形状透明 + 与当前 GROUP 内的兄弟深色形状重叠 ≥ 65% → 视觉上在深色背景上，保白
+    - 其他所有情况 → 全部改为深色
+
+    关键设计：_sibling_dark 只包含同一 GROUP 层级的直接兄弟深色形状。
+    这避免了全局 _dark_regions 的跨组误判问题：
+    - 架构图 GROUP：深色格子在子 GROUP 里，外层兄弟无深色形状 → 透明标题改黑
+    - Agent Framework GROUP：深色面板和透明标签是同层兄弟，直接叠放 → 标签保白
     """
     try:
         from pptx.enum.shapes import MSO_SHAPE_TYPE
         if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            # 构建本 GROUP 直接子级的深色形状区域（不递归，只看直接兄弟）
+            sibling_dark = []
             for child in shape.shapes:
-                _fix_shape_text_colors_smart(child, dark_hex)
+                if _shape_has_dark_fill(child):
+                    sibling_dark.append((child.left, child.top,
+                                         child.left + child.width,
+                                         child.top + child.height))
+            for child in shape.shapes:
+                _fix_shape_text_colors_smart(child, dark_hex, _sibling_dark=sibling_dark)
             return
     except Exception:
         pass
 
     if _shape_has_dark_fill(shape):
-        return  # 深色背景，白字保留
+        # 深色填充 → 背景深色，白字正确，只修渐变文字
+        try:
+            _fix_gradient_text_xml(shape._element)
+        except Exception:
+            pass
+        return
+
+    # 透明形状：检查是否与兄弟深色形状大面积重叠
+    if _sibling_dark:
+        try:
+            from pptx.enum.dml import MSO_FILL
+            ft = shape.fill.type
+            is_transparent = ft is None or ft == MSO_FILL.BACKGROUND
+        except Exception:
+            is_transparent = True
+        if is_transparent:
+            try:
+                sl = shape.left; st = shape.top
+                sr = sl + shape.width; sb = st + shape.height
+                area = max((sr - sl) * (sb - st), 1)
+                for (rl, rt, rr, rb) in _sibling_dark:
+                    ox = max(0, min(sr, rr) - max(sl, rl))
+                    oy = max(0, min(sb, rb) - max(st, rt))
+                    if (ox * oy) / area > 0.65:
+                        # 叠在深色兄弟形状上，保留白字（只修渐变）
+                        try:
+                            _fix_gradient_text_xml(shape._element)
+                        except Exception:
+                            pass
+                        return
+            except Exception:
+                pass
 
     try:
         _fix_text_colors_xml(shape._element, dark_hex)
@@ -374,6 +534,128 @@ def _fix_shape_fills(shape):
         pass
 
 
+# 大面积深色形状透明化：面积 > 此比例 → 加透明度（避免深色底来源的色块在浅色底上过于突兀）
+_LARGE_DARK_AREA_THRESHOLD = 0.008  # 占幻灯片面积 0.8%（覆盖小圆盘等设计元素）
+_LARGE_DARK_ALPHA = 15000           # 15% 不透明（85% 透明），深蓝 → 很淡的色调
+
+# 大面积浅色形状透明化：浅色底来源 → 深色底模板，浅色大卡片在深色背景上太亮
+_LARGE_LIGHT_AREA_THRESHOLD = 0.05  # 占幻灯片面积 5%（针对大卡片/色块）
+_LARGE_LIGHT_ALPHA = 20000          # 20% 不透明（80% 透明），白色 → 半透明玻璃感
+
+
+def _lighten_large_dark_shapes(slide, slide_area):
+    """
+    对面积超过阈值的大面积深色实色形状，添加透明度。
+    深色底的大色块（如架构图底座）在浅色底上会显得很突兀，加透明度后变成淡色调。
+    只处理实色填充（SOLID）；渐变形状暂不处理。
+    """
+    from lxml import etree
+    NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+
+    def _add_alpha(shape):
+        try:
+            from pptx.enum.dml import MSO_FILL
+            if shape.fill.type != MSO_FILL.SOLID:
+                return
+            # 找形状填充的 solidFill 元素（在 spPr 下，不是文字 rPr 下）
+            sp_el = shape._element
+            # 只找 spPr 直接子孙的 solidFill，避免误改文字颜色
+            sp_pr = sp_el.find(f'.//{{{NS_A}}}spPr') or sp_el  # 兼容不同命名
+            # 直接搜 p:spPr 下的 a:solidFill
+            NS_P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+            for spPr in sp_el.iter(f'{{{NS_P}}}spPr', f'{{{NS_A}}}spPr'):
+                sf = spPr.find(f'{{{NS_A}}}solidFill')
+                if sf is None:
+                    continue
+                children = list(sf)
+                if not children:
+                    continue
+                clr = children[0]
+                # 移除已有 alpha，插入新 alpha
+                old = clr.find(f'{{{NS_A}}}alpha')
+                if old is not None:
+                    clr.remove(old)
+                a_el = etree.SubElement(clr, f'{{{NS_A}}}alpha')
+                a_el.set('val', str(_LARGE_DARK_ALPHA))
+                return  # 只改第一个 spPr 里的填充
+        except Exception:
+            pass
+
+    def _process_shapes(shapes):
+        for shape in shapes:
+            try:
+                from pptx.enum.shapes import MSO_SHAPE_TYPE
+                if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    _process_shapes(shape.shapes)  # 递归进 GROUP
+                    continue
+                area_pct = (shape.width * shape.height) / max(slide_area, 1)
+                if area_pct < _LARGE_DARK_AREA_THRESHOLD:
+                    continue
+                if not _shape_has_dark_fill(shape):
+                    continue
+                # 有文字内容的深色形状是内容元素（标签/徽章等），不加透明度。
+                # 加透明度后白字会印在近白背景上变得不可见。
+                try:
+                    if shape.has_text_frame and shape.text_frame.text.strip():
+                        continue
+                except Exception:
+                    pass
+                _add_alpha(shape)
+            except Exception:
+                pass
+
+    _process_shapes(slide.shapes)
+
+
+def _make_large_light_shapes_transparent(slide, slide_area):
+    """
+    浅色底来源 → 深色底模板：对大面积无显式填充的形状注入半透明白色填充。
+
+    这类形状（如大卡片、背景色块）fill 来自主题 style，没有 spPr 填充声明，
+    视觉上呈现浅色/白色。在深色底模板上显得突兀，加高透明度后呈现玻璃感。
+    """
+    from lxml import etree
+    NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    NS_P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+    _FILL_TAGS = {f'{{{NS_A}}}{t}' for t in
+                  ('solidFill', 'gradFill', 'blipFill', 'pattFill', 'noFill', 'grpSpFill')}
+
+    def _has_explicit_fill(sp_el):
+        """检查 spPr 是否有显式填充声明（有则不动）。"""
+        spPr = sp_el.find(f'{{{NS_A}}}spPr')
+        if spPr is None:
+            return False
+        return any(child.tag in _FILL_TAGS for child in spPr)
+
+    def _inject_transparent_fill(sp_el):
+        """向 spPr 注入带透明度的白色实色填充。"""
+        spPr = sp_el.find(f'{{{NS_A}}}spPr')
+        if spPr is None:
+            spPr = etree.SubElement(sp_el, f'{{{NS_A}}}spPr')
+        sf   = etree.SubElement(spPr, f'{{{NS_A}}}solidFill')
+        srgb = etree.SubElement(sf,   f'{{{NS_A}}}srgbClr')
+        srgb.set('val', 'FFFFFF')
+        alpha = etree.SubElement(srgb, f'{{{NS_A}}}alpha')
+        alpha.set('val', str(_LARGE_LIGHT_ALPHA))
+
+    def _process(shapes):
+        for shape in shapes:
+            try:
+                if hasattr(shape, 'shapes'):   # GROUP
+                    _process(shape.shapes)
+                    continue
+                area_pct = (shape.width * shape.height) / max(slide_area, 1)
+                if area_pct < _LARGE_LIGHT_AREA_THRESHOLD:
+                    continue
+                if _has_explicit_fill(shape._element):
+                    continue
+                _inject_transparent_fill(shape._element)
+            except Exception:
+                pass
+
+    _process(slide.shapes)
+
+
 def fix_colors_for_light_template(pptx_path, slide_indices):
     """
     对指定页（1-based）修复深色来源的颜色：
@@ -392,18 +674,21 @@ def fix_colors_for_light_template(pptx_path, slide_indices):
     prs = Presentation(str(pptx_path))
     for idx in slide_indices:
         slide = prs.slides[idx - 1]
-        for shape in slide.shapes:             # 智能文字修复（深色背景形状跳过）
+        for shape in slide.shapes:             # 文字修复：深色填充保白，其余全改黑
             _fix_shape_text_colors_smart(shape)
-        for shape in slide.shapes:             # API 级填充修复
+        for shape in slide.shapes:             # API 级填充修复：浅色实心填充 → 透明
             _fix_shape_fills(shape)
+        slide_area = prs.slide_width * prs.slide_height
+        _lighten_large_dark_shapes(slide, slide_area)  # 大面积深色形状 → 加透明度
     prs.save(str(pptx_path))
     print(f"  [颜色修复] 已修复第 {slide_indices} 页（深色底来源 → 浅色底适配）")
 
 
 def _fix_text_to_white_xml(element):
     """
-    将元素内深色文字改为白色（XML 级，用于浅色底来源 → 深色底模板适配）。
+    将元素内非白色文字改为白色（XML 级，用于浅色底来源 → 深色底模板适配）。
     只处理 rPr / defRPr 中的 solidFill。
+    规则：透明/无填充背景下，任何非近白色文字 → 白色，确保深色底可见。
     """
     from lxml import etree
     NS_A   = 'http://schemas.openxmlformats.org/drawingml/2006/main'
@@ -412,7 +697,8 @@ def _fix_text_to_white_xml(element):
     PRST   = f'{{{NS_A}}}prstClr'
     RPR    = f'{{{NS_A}}}rPr'
     DEFRPR = f'{{{NS_A}}}defRPr'
-    _DARK_PRESET = {'black', 'darkGray'}
+    # 近白色预设：这些颜色在深色底上本已可见，保留
+    _NEAR_WHITE_PRESET = {'white', 'ltGray', 'lightGray', 'silver', 'gainsboro'}
 
     for tag in (RPR, DEFRPR):
         for el in element.iter(tag):
@@ -423,12 +709,14 @@ def _fix_text_to_white_xml(element):
                     etree.SubElement(sf, SRGB).set('val', 'FFFFFF')
                     continue
                 child = children[0]
-                if child.tag == PRST and child.get('val', '') in _DARK_PRESET:
+                if child.tag == PRST and child.get('val', '') not in _NEAR_WHITE_PRESET:
+                    # 非近白预设（黑、蓝、红等）→ 改白
                     sf.remove(child)
                     etree.SubElement(sf, SRGB).set('val', 'FFFFFF')
                 elif child.tag == SRGB:
                     val = child.get('val', '')
-                    if len(val) == 6 and _hex_luminance(val) < 80:
+                    # 非近白 srgbClr（任一通道 < 200）→ 改白
+                    if len(val) == 6 and not _is_light_hex(val):
                         child.set('val', 'FFFFFF')
 
 
@@ -482,6 +770,17 @@ def fix_colors_for_dark_template(pptx_path, slide_indices):
     prs = Presentation(str(pptx_path))
     for idx in slide_indices:
         slide = prs.slides[idx - 1]
+        slide_area = slide.shapes._spTree.getparent().getparent()
+        try:
+            from pptx.util import Emu
+            w = prs.slide_width
+            h = prs.slide_height
+            slide_area_val = w * h
+        except Exception:
+            slide_area_val = 1
+        # Step 1：大面积浅色形状 → 半透明（先于文字修复，避免干扰后续判断）
+        _make_large_light_shapes_transparent(slide, slide_area_val)
+        # Step 2：透明/无填充形状中的非白色文字 → 白色
         for shape in slide.shapes:
             _fix_shape_text_to_dark_template(shape)
     prs.save(str(pptx_path))
