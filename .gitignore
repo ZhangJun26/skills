@@ -10,6 +10,10 @@ __pycache__/
 输出/
 tasks/
 
+# 维护工具（仅供仓库维护者本地使用）
+pack_skill.py
+slide-blocks.zip
+
 # 系统文件
 .DS_Store
 Thumbs.db
