@@ -7,36 +7,69 @@ description: PPT 智能组装助手。用于从素材库中挑选幻灯片、拼
 
 ## 初始化：确定 skill 路径
 
-**每次被调用时，首先执行以下代码**，后续所有操作都基于这些变量：
+**所有脚本必须写入 `.py` 文件后通过 Bash 运行，不得用 `python -c "..."`**（因为 `__file__` 在内联执行时不存在）。
+
+所有任务脚本放在 `tasks/` 目录下，用以下固定 bootstrap 开头（`tasks/` 在 skill 根目录下一级，所以 `parent.parent` 就是 skill 根）：
 
 ```python
 import sys, os
 from pathlib import Path
 
-# config.py 的 __file__ 固定指向 skill 根目录下的 slide_vault/config.py
-# 所以 skill 根目录 = config.py 所在目录的上一级，无需猜测安装位置
-sys.path.insert(0, str(Path(__file__).parent))  # 先临时用任意路径找到 config
-from slide_vault.config import CONFIG_PATH
-SKILL_DIR = CONFIG_PATH.parent                   # config.yaml 所在目录 = skill 根目录
-
-os.chdir(str(SKILL_DIR))                         # 确保相对路径（如 slide_vault.db）正确解析
-sys.path.insert(0, str(SKILL_DIR))
-sys.path.insert(0, str(SKILL_DIR / "engine"))
+_SKILL_DIR = Path(__file__).parent.parent   # tasks/ → skill 根目录
+sys.path.insert(0, str(_SKILL_DIR))
+sys.path.insert(0, str(_SKILL_DIR / "engine"))
+os.chdir(str(_SKILL_DIR))
 
 import yaml
-_config = yaml.safe_load((SKILL_DIR / "config.yaml").read_text(encoding="utf-8"))
+_config = yaml.safe_load((_SKILL_DIR / "config.yaml").read_text(encoding="utf-8"))
+SKILL_DIR     = _SKILL_DIR
 MATERIALS_DIR = _config.get("materials_dir", "")
 OUTPUT_DIR    = _config.get("output_dir", "")
-TEMPLATE_DIR  = SKILL_DIR / "模板"
+TEMPLATE_DIR  = _SKILL_DIR / "模板"
 ```
 
 初始化后，根据用户需求判断模式：
 
-- **Mode A（工具模式）**：统一标题栏、深浅色转换、局部编辑 — 不依赖素材库，`MATERIALS_DIR` 为空也可以直接进行
-- **Mode B（素材库模式）**：搜索素材、组装 PPT — 需要 `MATERIALS_DIR` 非空且已运行 `setup_paths.py`
+- **Mode A（工具模式）**：用户提供一个已有 PPT，要求转换色系或局部编辑 — 不依赖素材库，直接操作
+- **Mode B（素材库模式）**：从库中检索素材、组装新 PPT — 需要 `MATERIALS_DIR` 非空且已建库
 - **Mode C（建库模式）**：用户想用自己的素材库，需先完成建库流程（见下方"从零建库"）
 
 如果 `OUTPUT_DIR` 为空，提醒用户先在 `config.yaml` 填写 `output_dir`（建议填 skill 目录之外的路径，如 `D:/PPT输出`，避免 skill 更新时被覆盖）。
+
+---
+
+## Mode A：直接处理已有 PPT
+
+用户说「把这个PPT换成浅色底」「删掉第5页」「在第3章前加过渡页」时，**不需要收集需求，直接执行**。
+
+| 用户需求 | 使用工具 | 关键参数 |
+|---------|---------|---------|
+| 整份深↔浅色系转换 | `convert_deck.py` | `convert(path, to="light"/"dark")` |
+| 删/移/插入某页 | `edit_pptx.py` | `op: delete/move/insert_template` |
+| 替换某页内容 | `edit_pptx.py` | `op: replace, src=源文件, src_page=页码` |
+
+示例脚本（`tasks/task_edit_xxx.py`）：
+
+```python
+# tasks/task_edit_xxx.py
+import sys, os
+from pathlib import Path
+_SKILL_DIR = Path(__file__).parent.parent
+sys.path.insert(0, str(_SKILL_DIR))
+sys.path.insert(0, str(_SKILL_DIR / "engine"))
+os.chdir(str(_SKILL_DIR))
+
+# 色系转换
+from convert_deck import convert
+convert("D:/某文件.pptx", to="light")
+
+# 或局部编辑
+from edit_pptx import edit
+edit("D:/某文件.pptx", [
+    {"op": "delete", "pages": [5]},
+    {"op": "insert_template", "template_page": 2, "after": 3, "title": "新章节"},
+])
+```
 
 ---
 
@@ -46,12 +79,21 @@ TEMPLATE_DIR  = SKILL_DIR / "模板"
 
 向用户确认以下信息（已说明的直接跳过，不要重复询问）：
 
-1. **封面标题**：PPT 的主标题（可帮用户起一个备选）
-2. **章节结构**：要哪几个部分，每部分讲什么
-3. **素材来源**：指定来源文件，或从库里检索
-4. **模板风格**：深色底（默认）还是浅色底
+1. **章节结构**：要哪几个部分，每部分讲什么
+2. **素材来源**：指定来源文件，或从库里检索
+3. **🚨 模板风格（必问，不可跳过）**：深色底还是浅色底？用户说"都可以"时可自行判断；否则必须等用户明确回答后才能继续。
+4. **封面标题**（可选）：有则用，没有则组装时留空或先用主题词代替，后面再改
 
-⚠️ **必须等用户回答后，才能进入第二步。** 不得在用户回复之前执行任何搜索或 Bash 命令。收集需求阶段只做提问，不做执行。
+⚠️ **必须等用户回答深浅色底后，才能进入第二步。** 不得在用户回复之前执行任何搜索或 Bash 命令。
+
+### 第二步和第三步之间：展示方案，等确认
+
+搜索完成后，先将选页方案整理成完整表格展示给用户：
+
+| 页 | 来源文件 | 内容 | 质量 |
+|----|---------|------|------|
+
+**⚠️ 必须等用户说"可以"或提出修改意见后，才能进入第四步执行组装。** 不能在用户确认前直接写脚本执行。
 
 ### 第二步：搜索素材库
 
@@ -228,10 +270,14 @@ P3/P4 由引擎自动检测，不需要在 PLAN 里手动指定。
 
 - 电脑必须安装 Microsoft Office 或 WPS
 - 运行期间不要手动操作 PowerPoint 窗口
-- **颜色修复**：按需触发，不主动改动
-  - 文件名含"深色底"/"浅色底"关键词 → 与模板方向相反时自动触发
-  - 文件名没有关键词，但用户明确说"转成浅色底/深色底" → 在每个内容页 plan 项手动加 `"fix_colors": true`（浅色底方向）或 `"fix_colors_dark": true`（深色底方向）
-  - 用户没有提转换需求 → 不触发，保留原始颜色
+- **颜色修复**：按场景判断，不要默认触发
+
+| 场景 | 做法 |
+|------|------|
+| 源文件名含"深色底"，套浅色底模板 | 自动触发，无需手动设置 |
+| 源文件名含"浅色底"，套深色底模板 | 自动触发，无需手动设置 |
+| 文件名无关键词，用户明确要转换色系 | 每个内容页 plan 项加 `"fix_colors": true`（转浅）或 `"fix_colors_dark": true`（转深） |
+| 用户没提转换，只是组装 | 不触发，保留原始颜色 |
 - 输出同名文件会被覆盖，重要版本提前重命名备份
 
 ---
